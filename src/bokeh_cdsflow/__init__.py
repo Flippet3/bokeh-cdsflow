@@ -1,9 +1,9 @@
 from collections import defaultdict
 from enum import Enum, auto
-from inspect import get_annotations
 import os
 import re
-from typing import Any, Literal, get_args, get_origin
+from typing import Any, ClassVar, Literal, get_args
+
 from bokeh.document import Document
 from bokeh.embed import components
 from bokeh.events import DocumentReady
@@ -15,49 +15,53 @@ import pydantic
 JsType = Literal["number", "string", "boolean", "object", "array", "date", "bigint", "symbol", "function", "undefined", "null", "map", "set"]  # fmt: skip
 _JS_TYPES: frozenset[str] = frozenset(get_args(JsType))
 
+CdsFlowColumnSpec = tuple[str, list[Any]]
+
 
 class InputType(Enum):
     SingleValue = auto()
     Array = auto()
 
 
-class SuperCDSColumn(pydantic.BaseModel):
+class CdsFlowColumn(pydantic.BaseModel):
     name: str
     js_type: JsType
     initial_value: list = []
     input_type: InputType = InputType.Array
 
 
-class LinkedSuperCDSColumn(pydantic.BaseModel):
-    super_cds_column: SuperCDSColumn
-    super_cds_name: str
+class LinkedCdsFlowColumn(pydantic.BaseModel):
+    cds_flow_column: CdsFlowColumn
+    cds_flow_name: str
 
     @property
     def js_attr_name(self) -> str:
-        return f"{self.super_cds_name}_{self.super_cds_column.name}"
+        return f"{self.cds_flow_name}_{self.cds_flow_column.name}"
 
     @property
     def js_attr_type(self) -> str:
-        if self.super_cds_column.input_type == InputType.SingleValue:
-            return self.super_cds_column.js_type
+        if self.cds_flow_column.input_type == InputType.SingleValue:
+            return self.cds_flow_column.js_type
         else:
-            return f"{self.super_cds_column.js_type}[]"
+            return f"{self.cds_flow_column.js_type}[]"
 
     @property
     def js_input(self) -> str:
-        if self.super_cds_column.input_type == InputType.SingleValue:
-            return f"{self.super_cds_name}.data.{self.super_cds_column.name}[0]"
+        if self.cds_flow_column.input_type == InputType.SingleValue:
+            return f"{self.cds_flow_name}.data.{self.cds_flow_column.name}[0]"
         else:
-            return f"[... {self.super_cds_name}.data.{self.super_cds_column.name}]"
+            return f"[... {self.cds_flow_name}.data.{self.cds_flow_column.name}]"
 
 
-class SuperCDS:
+class CdsFlow:
     def __init__(
         self,
         name: str,
-        columns: list[SuperCDSColumn],
-        depends_on_columns: list[LinkedSuperCDSColumn] = [],
+        columns: list[CdsFlowColumn],
+        depends_on_columns: list[LinkedCdsFlowColumn] | None = None,
     ):
+        if depends_on_columns is None:
+            depends_on_columns = []
         self.name = name
         if columns:
             if len({col.input_type for col in columns}) > 1:
@@ -67,14 +71,14 @@ class SuperCDS:
         self.depends_on_columns = depends_on_columns
 
     @property
-    def columns(self) -> dict[str, LinkedSuperCDSColumn]:
+    def columns(self) -> dict[str, LinkedCdsFlowColumn]:
         if not hasattr(self, "_base_columns"):
             return {}
-        return {base_column.name: LinkedSuperCDSColumn(super_cds_column=base_column, super_cds_name=self.name) for base_column in self._base_columns}
+        return {base_column.name: LinkedCdsFlowColumn(cds_flow_column=base_column, cds_flow_name=self.name) for base_column in self._base_columns}
 
     @property
     def dependencies(self) -> set[str]:
-        return {depends_on_column.super_cds_name for depends_on_column in self.depends_on_columns}
+        return {depends_on_column.cds_flow_name for depends_on_column in self.depends_on_columns}
 
     @property
     def callback_name(self) -> str:
@@ -107,13 +111,13 @@ class SuperCDS:
             start_idx = contents.index(START_MARKER) + len(START_MARKER)
             end_idx = contents.index(END_MARKER)
 
-            jsdoc_lines = [f" * @param {{{col.js_attr_type}}} this_{col.super_cds_column.name}" for col in self.columns.values()]
+            jsdoc_lines = [f" * @param {{{col.js_attr_type}}} this_{col.cds_flow_column.name}" for col in self.columns.values()]
             jsdoc_lines += [f" * @param {{{linked_col.js_attr_type}}} {linked_col.js_attr_name}" for linked_col in self.depends_on_columns]
 
             params = [f"this_{col.name}" for col in self._base_columns] + [linked_col.js_attr_name for linked_col in self.depends_on_columns]
 
             if self._base_columns:
-                returns_contents = ", ".join(f"{col.super_cds_column.name}: {col.js_attr_type}" for col in self.columns.values())
+                returns_contents = ", ".join(f"{col.cds_flow_column.name}: {col.js_attr_type}" for col in self.columns.values())
                 returns_line = f" * @returns {{{{{returns_contents}}}}}"
             else:
                 returns_line = " * @returns {{}}"
@@ -126,29 +130,27 @@ class SuperCDS:
 
             between_markers = jsdoc_text + func_signature
 
-            # Re-compose file contents
             new_contents = contents[:start_idx] + "\n" + between_markers + contents[end_idx:]
 
-            # Write back to file
             f.seek(0)
             f.write(new_contents)
             f.truncate()
 
 
-class SuperCDSDataflow:
-    def __init__(self, super_cdss: list[SuperCDS], js_dir: str, tick_ms: int, engine_setup: str, engine_code: str):
+class CdsFlowManager:
+    def __init__(self, cds_flows: list[CdsFlow], js_dir: str, tick_ms: int, engine_setup: str, engine_code: str):
         if not (isinstance(js_dir, str) and os.path.isdir(js_dir)):
             raise ValueError(f"js_dir '{js_dir}' is not a valid directory")
         self.js_dir = js_dir
-        self.super_cdss = {super_cds.name: super_cds for super_cds in super_cdss}
+        self.cds_flows = {flow.name: flow for flow in cds_flows}
         self.doc = Document()
         self.engine_code = engine_code
         self.engine_setup = engine_setup
         self.tick_ms = tick_ms
 
     def update_signatures(self):
-        for super_cds in self.super_cdss.values():
-            super_cds._update_signature(self.js_dir)
+        for flow in self.cds_flows.values():
+            flow._update_signature(self.js_dir)
 
     def clear_js_files(self):
         response = input(f"Are you sure? This will delete all .js files in {self.js_dir}. Only by entering 'y' will this actually happen.").lower()
@@ -160,91 +162,84 @@ class SuperCDSDataflow:
                 if os.path.isfile(file_path):
                     os.remove(file_path)
 
-    def get_components_and_script(self, dom_elements: dict[str, DOMElement] = {}) -> tuple[str, dict[str, str]]:
-        # Fresh document each embed so DocumentReady handlers do not stack, and so
-        # roots + js_on_event stay on the same instance that components() serializes.
+    def get_components_and_script(self, dom_elements: dict[str, DOMElement] | None = None) -> tuple[str, dict[str, str]]:
+        if dom_elements is None:
+            dom_elements = {}
         self.doc = Document()
         self._attach_loop(self.doc)
 
-        # Bokeh's components() uses OutputDocumentFor: it only keeps document-level
-        # state (e.g. js_on_event) if the passed models are *exactly* this doc's roots.
         new_dom_elements = dict(dom_elements)
         for value in dom_elements.values():
             self.doc.add_root(value)
-        for i, super_cds in enumerate(self.super_cdss.values()):
-            new_dom_elements[f"source_{i}"] = super_cds.source
-            self.doc.add_root(super_cds.source)
+        for i, flow in enumerate(self.cds_flows.values()):
+            new_dom_elements[f"source_{i}"] = flow.source
+            self.doc.add_root(flow.source)
 
         assert set(new_dom_elements.values()) == set(self.doc.roots)
 
         script, divs = components(new_dom_elements)
         return script, divs
 
-    def _attach_loop(self, doc):
+    def _attach_loop(self, doc: Document) -> None:
         self.update_signatures()
         callbacks = "\n"
-        for super_cds in self.super_cdss.values():
-            if len(super_cds.dependencies) > 0:
-                with open(super_cds.callback_location(self.js_dir), "r") as f:
+        for flow in self.cds_flows.values():
+            if len(flow.dependencies) > 0:
+                with open(flow.callback_location(self.js_dir), "r") as f:
                     cb = f.read()
                 callbacks += cb + "\n"
 
-        dirty_requests = defaultdict(list)
-        for super_cds in self.super_cdss.values():
-            for dependency in super_cds.dependencies:
-                dirty_requests[dependency].append(super_cds.name)
+        dirty_requests: defaultdict[str, list[str]] = defaultdict(list)
+        for flow in self.cds_flows.values():
+            for dependency in flow.dependencies:
+                dirty_requests[dependency].append(flow.name)
 
-        unresolved_cdss = sorted(self.super_cdss.keys())
-        resolved_cdss = set()
-        graph = []
-        while len(unresolved_cdss) > 0:
-            for unresolved_cds_name in unresolved_cdss:
-                unresolved_cds = self.super_cdss[unresolved_cds_name]
-                if len(unresolved_cds.dependencies - resolved_cdss) == 0:
-                    graph.append(unresolved_cds_name)
-                    resolved_cdss.add(unresolved_cds_name)
-                    unresolved_cdss.remove(unresolved_cds_name)
+        unresolved = sorted(self.cds_flows.keys())
+        resolved: set[str] = set()
+        graph: list[str] = []
+        while len(unresolved) > 0:
+            for unresolved_name in unresolved:
+                unresolved_flow = self.cds_flows[unresolved_name]
+                if len(unresolved_flow.dependencies - resolved) == 0:
+                    graph.append(unresolved_name)
+                    resolved.add(unresolved_name)
+                    unresolved.remove(unresolved_name)
                     break
             else:
-                raise ValueError(f"Couldn't establish non-circular dependency graph. Resolved_cdss: {resolved_cdss}. Graph so far: {graph}")
+                raise ValueError(f"Couldn't establish non-circular dependency graph. Resolved: {resolved}. Graph so far: {graph}")
 
         update_script = ""
         for cds_name in graph:
-            # Should be different logic if dependecies is empty
-            # jsdoc_lines = [f" * @param {{{col.js_attr_type}}} this_{col.super_cds_column.name}" for col in self.columns.values()]
-            # jsdoc_lines += [f" * @param {{{linked_col.js_attr_type}}} {linked_col.js_attr_name}" for linked_col in self.depends_on_columns]
-
-            super_cds = self.super_cdss[cds_name]
+            flow = self.cds_flows[cds_name]
             reflog_checks = [
-                f'refLog["{super_cds.name}"]["{col.super_cds_column.name}"] != {super_cds.name}.data.{col.super_cds_column.name}'
-                for col in super_cds.columns.values()
+                f'refLog["{flow.name}"]["{col.cds_flow_column.name}"] != {flow.name}.data.{col.cds_flow_column.name}' for col in flow.columns.values()
             ]
             update_script += f"""
                 // check if need for update
-                if (!dirty.includes("{super_cds.name}")) {{
+                if (!dirty.includes("{flow.name}")) {{
                     if ({" || ".join(reflog_checks)}) {{
-                        dirty.push("{super_cds.name}");
+                        dirty.push("{flow.name}");
                     }}
                 }}
-                if (dirty.includes("{super_cds.name}")) {{"""
-            if len(super_cds.dependencies) > 0:
-                args = [col.js_input for col in list(super_cds.columns.values()) + super_cds.depends_on_columns]
-                input_type = next(iter(super_cds.columns.values())).super_cds_column.input_type
+                if (dirty.includes("{flow.name}")) {{"""
+            if len(flow.dependencies) > 0:
+                args = [col.js_input for col in list(flow.columns.values()) + flow.depends_on_columns]
+                input_type = next(iter(flow.columns.values())).cds_flow_column.input_type
                 if input_type == InputType.SingleValue:
-                    assignments = [f"'{col.super_cds_column.name}': [new_data.{col.super_cds_column.name}]" for col in super_cds.columns.values()]
+                    assignments = [f"'{col.cds_flow_column.name}': [new_data.{col.cds_flow_column.name}]" for col in flow.columns.values()]
                 else:
-                    assignments = [f"'{col.super_cds_column.name}': new_data.{col.super_cds_column.name}" for col in super_cds.columns.values()]
+                    assignments = [f"'{col.cds_flow_column.name}': new_data.{col.cds_flow_column.name}" for col in flow.columns.values()]
 
                 update_script += f"""
-                    new_data = {super_cds.callback_name}({", ".join(args)});
-                    {super_cds.name}.data = {{
+                    new_data = {flow.callback_name}({", ".join(args)});
+                    {flow.name}.data = {{
                         {", ".join(assignments)}
                     }};"""
-            if len(dirty_requests[super_cds.name]) > 0:
+            if len(dirty_requests[flow.name]) > 0:
                 update_script += f"""
-                    ["{'","'.join(dirty_requests[super_cds.name])}"].forEach((dep) => {{if (!dirty.includes(dep) && dep !== "") {{dirty.push(dep)}}}});"""
+                    ["{'","'.join(dirty_requests[flow.name])}"].forEach((dep) => {{if (!dirty.includes(dep) && dep !== "") {{dirty.push(dep)}}}});"""
             update_script += f"""
-                    dirty.splice(dirty.indexOf('{super_cds.name}'), 1);"""
+                    dirty.splice(dirty.indexOf('{flow.name}'), 1);"""
 
             update_script += f"""
                     {"; ".join(it.replace("!=", "=") for it in reflog_checks)};
@@ -253,7 +248,7 @@ class SuperCDSDataflow:
             """
 
         c = CustomJS(
-            args={super_cds.name: super_cds.source for super_cds in self.super_cdss.values()},
+            args={flow.name: flow.source for flow in self.cds_flows.values()},
             code=f"""
                 {callbacks}
 
@@ -272,24 +267,28 @@ class SuperCDSDataflow:
         doc.js_on_event(DocumentReady, c)
 
 
-def _normalize_js_type_annotation(js_type_ann: Any) -> str:
-    if isinstance(js_type_ann, str) and js_type_ann in _JS_TYPES:
-        return js_type_ann
-    if get_origin(js_type_ann) is Literal:
-        args = get_args(js_type_ann)
-        if len(args) == 1 and args[0] in _JS_TYPES:
-            return args[0]
-    raise TypeError(f"Column annotation must be a JsType string or Literal[JsType], got {js_type_ann!r}")
+def _normalize_js_type_string(s: str) -> JsType:
+    if s in _JS_TYPES:
+        return s  # type: ignore[return-value]
+    raise TypeError(f"Column js type must be a JsType string, got {s!r}")
 
 
-class AnnotatedStr(str):
-    """String that behaves like a normal ``str`` (e.g. for Bokeh field names) but can carry metadata."""
+def _is_column_spec(val: Any) -> bool:
+    if not isinstance(val, tuple) or len(val) != 2:
+        return False
+    js_t, init = val
+    if not isinstance(js_t, str) or not isinstance(init, list):
+        return False
+    return js_t in _JS_TYPES
 
-    # This lets static analyzers know about these attributes.
-    linked_column: LinkedSuperCDSColumn
+
+class CdsFlowStr(str):
+    """Column name as ``str`` for Bokeh, with linkage metadata."""
+
+    linked_column: LinkedCdsFlowColumn
     extra_info: Any
 
-    def __new__(cls, value: str, linked_column: LinkedSuperCDSColumn, extra_info: Any = None, /, **meta: Any):
+    def __new__(cls, value: str, linked_column: LinkedCdsFlowColumn, extra_info: Any = None, /, **meta: Any):
         obj = str.__new__(cls, value)
         obj.extra_info = extra_info
         for k, v in meta.items():
@@ -297,30 +296,51 @@ class AnnotatedStr(str):
         obj.linked_column = linked_column
         return obj
 
+    @classmethod
+    def spec(cls, js_type: JsType, initial: list[Any]) -> CdsFlowColumnSpec:
+        """Return a column spec tuple; equivalent to ``(js_type, initial)`` with clearer hints."""
+        return (js_type, initial)
 
-class SuperCDSMeta(type):
-    """Builds a :class:`SuperCDS` from annotated class attributes and wires column names as :class:`AnnotatedStr`."""
+
+_CDS_FLOW_RESERVED_NAMES = frozenset(
+    {
+        "input_type",
+        "depends_on_columns",
+        "__cds_name__",
+        "__module__",
+        "__qualname__",
+        "__doc__",
+        "__annotations__",
+        "cds_flow",
+        "source",
+    }
+)
+
+
+class _CdsFlowMeta(type):
+    """Builds a :class:`CdsFlow` from ``(js_type, initial_list)`` column specs and assigns :class:`CdsFlowStr` handles."""
 
     def __new__(mcs, cls_name: str, bases: tuple[type, ...], namespace: dict[str, Any]) -> type:
-        cls = super().__new__(mcs, cls_name, bases, namespace)
-        if cls_name.startswith("_") or getattr(cls, "__abstract_cds__", False):
-            return cls
+        if cls_name == "CdsFlowBase":
+            return super().__new__(mcs, cls_name, bases, namespace)
+        has_flow_ancestor = CdsFlowBase in bases or any(isinstance(b, type) and issubclass(b, CdsFlowBase) for b in bases)
+        if not has_flow_ancestor:
+            return super().__new__(mcs, cls_name, bases, namespace)
 
-        annotations = get_annotations(cls)
         input_type = namespace.get("input_type", InputType.Array)
         depends_spec = namespace.get("depends_on_columns", [])
 
-        super_columns: list[SuperCDSColumn] = []
+        flow_columns: list[CdsFlowColumn] = []
         column_names: list[str] = []
-        for col_name, js_type_ann in annotations.items():
-            if col_name not in namespace:
+        for col_name, val in list(namespace.items()):
+            if col_name.startswith("_") or col_name in _CDS_FLOW_RESERVED_NAMES:
                 continue
-            init_val = namespace[col_name]
-            if not isinstance(init_val, list):
+            if not _is_column_spec(val):
                 continue
-            js_type = _normalize_js_type_annotation(js_type_ann)
-            super_columns.append(
-                SuperCDSColumn(
+            js_raw, init_val = val
+            js_type = _normalize_js_type_string(js_raw)
+            flow_columns.append(
+                CdsFlowColumn(
                     name=col_name,
                     js_type=js_type,
                     initial_value=init_val,
@@ -329,36 +349,43 @@ class SuperCDSMeta(type):
             )
             column_names.append(col_name)
 
-        if not super_columns:
-            return cls
+        if not flow_columns:
+            return super().__new__(mcs, cls_name, bases, namespace)
 
         cds_name = namespace.get("__cds_name__", re.sub(r"(?<!^)(?=[A-Z])", "_", cls_name).lower())
-        linked_deps: list[LinkedSuperCDSColumn] = []
+        linked_deps: list[LinkedCdsFlowColumn] = []
         items: tuple[Any, ...] = depends_spec if isinstance(depends_spec, (list, tuple)) else (depends_spec,)
         for item in items:
-            if isinstance(item, type) and getattr(item, "super_cds", None) is not None:
-                linked_deps.extend(item.super_cds.columns.values())
-            elif isinstance(item, AnnotatedStr):
+            if isinstance(item, type) and getattr(item, "cds_flow", None) is not None:
+                linked_deps.extend(item.cds_flow.columns.values())
+            elif isinstance(item, CdsFlowStr):
                 linked_deps.append(item.linked_column)
             else:
-                raise TypeError(f"depends_on_columns entry must be a SuperCDS class or column ref, got {item!r}")
-        super_cds = SuperCDS(cds_name, super_columns, depends_on_columns=linked_deps)
+                raise TypeError(f"depends_on_columns entry must be a CdsFlowBase subclass or CdsFlowStr, got {item!r}")
+
+        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps)
 
         for col_name in column_names:
-            base_col = next(c for c in super_columns if c.name == col_name)
-            linked = LinkedSuperCDSColumn(super_cds_column=base_col, super_cds_name=cds_name)
-            setattr(
-                cls,
+            base_col = next(c for c in flow_columns if c.name == col_name)
+            linked = LinkedCdsFlowColumn(cds_flow_column=base_col, cds_flow_name=cds_name)
+            namespace[col_name] = CdsFlowStr(
                 col_name,
-                AnnotatedStr(
-                    col_name,
-                    linked,
-                    extra_info={"js_type": base_col.js_type, "super_cds_name": cds_name},
-                    js_type=base_col.js_type,
-                    super_cds_name=cds_name,
-                ),
+                linked,
+                extra_info={"js_type": base_col.js_type, "cds_flow_name": cds_name},
+                js_type=base_col.js_type,
+                cds_flow_name=cds_name,
             )
 
-        cls.super_cds = super_cds
-        cls.source = super_cds.source
-        return cls
+        namespace["cds_flow"] = flow
+        namespace["source"] = flow.source
+        return super().__new__(mcs, cls_name, bases, namespace)
+
+
+class CdsFlowBase(metaclass=_CdsFlowMeta):
+    """Declarative CDS flow row; not instantiable."""
+
+    source: ClassVar[ColumnDataSource]
+    cds_flow: ClassVar[CdsFlow]
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError(f"{cls.__name__} is declarative only and cannot be instantiated.")
