@@ -37,3 +37,6 @@ packages = ["src/bokeh_cdsflow"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/bokeh_cdsflow", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 160
