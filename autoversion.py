@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Resolve ``version = "...${{X}}..."`` in pyproject.toml against PyPI.
+Resolve the ``[project].version`` line in ``pyproject.toml`` against PyPI.
 
-For the current major.minor prefix (e.g. 0.1.), X is 0 when no matching
-``major.minor.N`` release exists on PyPI; otherwise max(N) + 1.
-Uses only the standard library (urllib, no requests).
+Supports either:
+
+- ``version = "M.m.${{X}}"`` — placeholder ``${{X}}`` is replaced, or
+- ``version = "M.m.p"`` — a normal three-part semver; the third segment is
+  replaced by the next build number (PyPI max ``M.m.*`` + 1, or 0 if none).
+
+In both cases the next number is ``0`` when no ``M.m.N`` release exists on
+PyPI; otherwise ``max(N) + 1``. Uses only the standard library (no requests).
 """
 
 from __future__ import annotations
@@ -19,12 +24,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 PLACEHOLDER = "${{X}}"
-VERSION_LINE_RE = re.compile(
+VERSION_LINE_PLACEHOLDER_RE = re.compile(
     r"(?m)^(?P<prefix>version\s*=\s*\")(?P<base>[^\"]*)"
     + re.escape(PLACEHOLDER)
     + r"(?P<suffix>\")$"
 )
-BASE_RE = re.compile(r"^(\d+)\.(\d+)\.$")
+BASE_BEFORE_PLACEHOLDER_RE = re.compile(r"^(\d+)\.(\d+)\.$")
+VERSION_LINE_SEMVER_RE = re.compile(
+    r'(?m)^version\s*=\s*"(?P<maj>\d+)\.(?P<min>\d+)\.(?P<mic>\d+)"\s*$'
+)
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 RELEASE_SUFFIX_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
@@ -40,21 +48,33 @@ def read_project_name(pyproject_path: Path) -> str:
     return name
 
 
-def parse_version_template(pyproject_text: str) -> tuple[str, int, int]:  # (full line, major, minor)
-    m = VERSION_LINE_RE.search(pyproject_text)
-    if not m:
-        raise SystemExit(
-            f'pyproject.toml: no line matching version = "...{PLACEHOLDER}..." '
-            "(single line, double-quoted value)."
+def parse_version_line(pyproject_text: str) -> tuple[str, int, int, str]:
+    """Return (full_line, major, minor, kind) where kind is ``placeholder`` or ``semver``."""
+    m = VERSION_LINE_PLACEHOLDER_RE.search(pyproject_text)
+    if m:
+        base = m.group("base")
+        bm = BASE_BEFORE_PLACEHOLDER_RE.match(base)
+        if not bm:
+            raise SystemExit(
+                f'pyproject.toml: version prefix before {PLACEHOLDER!r} must look like '
+                f'"major.minor." (got {base!r}).'
+            )
+        return m.group(0), int(bm.group(1)), int(bm.group(2)), "placeholder"
+
+    m2 = VERSION_LINE_SEMVER_RE.search(pyproject_text)
+    if m2:
+        return (
+            m2.group(0),
+            int(m2.group("maj")),
+            int(m2.group("min")),
+            "semver",
         )
-    base = m.group("base")
-    bm = BASE_RE.match(base)
-    if not bm:
-        raise SystemExit(
-            f'pyproject.toml: version prefix before {PLACEHOLDER!r} must look like '
-            f'"major.minor." (got {base!r}).'
-        )
-    return m.group(0), int(bm.group(1)), int(bm.group(2))
+
+    raise SystemExit(
+        "pyproject.toml: expected "
+        f'version = "M.m.{PLACEHOLDER}" or version = "M.m.p" (digits only), '
+        "single line, double-quoted."
+    )
 
 
 def fetch_release_versions(project_name: str, index_url: str) -> list[str]:
@@ -90,10 +110,10 @@ def next_build_number(major: int, minor: int, release_keys: list[str]) -> int:
     return max(candidates) + 1
 
 
-def apply_version(pyproject_text: str, new_line: str) -> str:
-    m = VERSION_LINE_RE.search(pyproject_text)
-    assert m is not None
-    return pyproject_text[: m.start()] + new_line + pyproject_text[m.end() :]
+def apply_version(pyproject_text: str, old_line: str, new_line: str) -> str:
+    start = pyproject_text.index(old_line)
+    end = start + len(old_line)
+    return pyproject_text[:start] + new_line + pyproject_text[end:]
 
 
 def run(
@@ -103,12 +123,15 @@ def run(
     index_url: str,
 ) -> str:
     text = pyproject_path.read_text(encoding="utf-8")
-    old_line, major, minor = parse_version_template(text)
+    old_line, major, minor, kind = parse_version_line(text)
     project_name = read_project_name(pyproject_path)
     keys = fetch_release_versions(project_name, index_url)
     n = next_build_number(major, minor, keys)
-    new_line = old_line.replace(PLACEHOLDER, str(n), 1)
-    new_text = apply_version(text, new_line)
+    if kind == "placeholder":
+        new_line = old_line.replace(PLACEHOLDER, str(n), 1)
+    else:
+        new_line = f'version = "{major}.{minor}.{n}"'
+    new_text = apply_version(text, old_line, new_line)
 
     resolved = f"{major}.{minor}.{n}"
     if dry_run:
@@ -127,8 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         "--pyproject",
         type=Path,
         default=Path(__file__).parent / "pyproject.toml",
-   
-        help="Path to pyproject.toml (default: ./pyproject.toml)",
+        help="Path to pyproject.toml (default: next to autoversion.py)",
     )
     p.add_argument(
         "--dry-run",

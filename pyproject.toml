@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bokeh-cdsflow"
-version = "0.1.${{X}}"
+version = "0.1.0"
 description = "Third-party extension for advanced linking of Bokeh CDSs; not affiliated with the Bokeh project."
 readme = "README.md"
 license = { file = "LICENSE" }
