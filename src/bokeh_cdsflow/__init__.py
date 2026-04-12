@@ -27,12 +27,12 @@ class CdsFlowColumn(pydantic.BaseModel):
     name: str
     js_type: JsType
     initial_value: list = []
-    input_type: InputType = InputType.Array
 
 
 class LinkedCdsFlowColumn(pydantic.BaseModel):
     cds_flow_column: CdsFlowColumn
     cds_flow_name: str
+    cds_flow_input_type: InputType = InputType.Array
 
     @property
     def js_attr_name(self) -> str:
@@ -40,17 +40,21 @@ class LinkedCdsFlowColumn(pydantic.BaseModel):
 
     @property
     def js_attr_type(self) -> str:
-        if self.cds_flow_column.input_type == InputType.SingleValue:
+        if self.cds_flow_input_type == InputType.SingleValue:
             return self.cds_flow_column.js_type
         else:
             return f"{self.cds_flow_column.js_type}[]"
 
     @property
+    def js_data_accessor(self) -> str:
+        return f"{self.cds_flow_name}.data.{self.cds_flow_column.name}"
+
+    @property
     def js_input(self) -> str:
-        if self.cds_flow_column.input_type == InputType.SingleValue:
-            return f"{self.cds_flow_name}.data.{self.cds_flow_column.name}[0]"
+        if self.cds_flow_input_type == InputType.SingleValue:
+            return f"{self.js_data_accessor}[0]"
         else:
-            return f"[... {self.cds_flow_name}.data.{self.cds_flow_column.name}]"
+            return f"[... {self.js_data_accessor}]"
 
 
 class CdsFlow:
@@ -59,13 +63,12 @@ class CdsFlow:
         name: str,
         columns: list[CdsFlowColumn],
         depends_on_columns: list[LinkedCdsFlowColumn] | None = None,
+        input_type: InputType = InputType.Array,
     ):
         if depends_on_columns is None:
             depends_on_columns = []
         self.name = name
-        if columns:
-            if len({col.input_type for col in columns}) > 1:
-                raise ValueError(f"Different input types found for {self.name}. {self.columns!r}")
+        self.input_type = input_type
         self._base_columns = columns
         self.source = ColumnDataSource({column.name: column.initial_value for column in columns})
         self.depends_on_columns = depends_on_columns
@@ -74,7 +77,14 @@ class CdsFlow:
     def columns(self) -> dict[str, LinkedCdsFlowColumn]:
         if not hasattr(self, "_base_columns"):
             return {}
-        return {base_column.name: LinkedCdsFlowColumn(cds_flow_column=base_column, cds_flow_name=self.name) for base_column in self._base_columns}
+        return {
+            base_column.name: LinkedCdsFlowColumn(
+                cds_flow_column=base_column,
+                cds_flow_name=self.name,
+                cds_flow_input_type=self.input_type,
+            )
+            for base_column in self._base_columns
+        }
 
     @property
     def dependencies(self) -> set[str]:
@@ -224,8 +234,7 @@ class CdsFlowManager:
                 if (dirty.includes("{flow.name}")) {{"""
             if len(flow.dependencies) > 0:
                 args = [col.js_input for col in list(flow.columns.values()) + flow.depends_on_columns]
-                input_type = next(iter(flow.columns.values())).cds_flow_column.input_type
-                if input_type == InputType.SingleValue:
+                if flow.input_type == InputType.SingleValue:
                     assignments = [f"'{col.cds_flow_column.name}': [new_data.{col.cds_flow_column.name}]" for col in flow.columns.values()]
                 else:
                     assignments = [f"'{col.cds_flow_column.name}': new_data.{col.cds_flow_column.name}" for col in flow.columns.values()]
@@ -344,7 +353,6 @@ class _CdsFlowMeta(type):
                     name=col_name,
                     js_type=js_type,
                     initial_value=init_val,
-                    input_type=input_type,
                 )
             )
             column_names.append(col_name)
@@ -363,11 +371,15 @@ class _CdsFlowMeta(type):
             else:
                 raise TypeError(f"depends_on_columns entry must be a CdsFlowBase subclass or CdsFlowStr, got {item!r}")
 
-        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps)
+        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps, input_type=input_type)
 
         for col_name in column_names:
             base_col = next(c for c in flow_columns if c.name == col_name)
-            linked = LinkedCdsFlowColumn(cds_flow_column=base_col, cds_flow_name=cds_name)
+            linked = LinkedCdsFlowColumn(
+                cds_flow_column=base_col,
+                cds_flow_name=cds_name,
+                cds_flow_input_type=input_type,
+            )
             namespace[col_name] = CdsFlowStr(
                 col_name,
                 linked,
@@ -389,3 +401,27 @@ class CdsFlowBase(metaclass=_CdsFlowMeta):
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Any:
         raise TypeError(f"{cls.__name__} is declarative only and cannot be instantiated.")
+
+    @classmethod
+    def set_value_str(cls, update_dict: dict[str, str]) -> str:
+        for key, value in update_dict.items():
+            key_str = str(key)
+            if key_str not in cls.cds_flow.columns:
+                raise KeyError(f"'{key}' is not a valid column name for {cls.cds_flow}")
+            if not value.startswith("[") and value.endswith("]"):
+                raise ValueError(f"'{key}' has value {value}. It needs to start with '[' and end with ']'.")
+            
+
+        items = []
+        for key, col in cls.cds_flow.columns.items():
+            key_str = str(key)
+            if key_str in update_dict:
+                val = update_dict[key_str]
+            else:
+                val = f"[... {col.js_data_accessor}]"
+            # Value is expected to be a string that will be placed in JS array notation
+            item_str = f"{key_str}: {val}"
+            items.append(item_str)
+
+        data_str = f"{cls.cds_flow.name}.data = {{{', '.join(items)}}}"
+        return data_str
