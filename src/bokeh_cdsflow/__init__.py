@@ -64,13 +64,17 @@ class CdsFlow:
         columns: list[CdsFlowColumn],
         depends_on_columns: list[LinkedCdsFlowColumn] | None = None,
         input_type: InputType = InputType.Array,
+        source: ColumnDataSource | None = None,
     ):
         if depends_on_columns is None:
             depends_on_columns = []
         self.name = name
         self.input_type = input_type
         self._base_columns = columns
-        self.source = ColumnDataSource({column.name: column.initial_value for column in columns})
+        if source is None:
+            self.source = ColumnDataSource({column.name: column.initial_value for column in columns})
+        else:
+            self.source = source
         self.depends_on_columns = depends_on_columns
 
     @property
@@ -371,7 +375,11 @@ class _CdsFlowMeta(type):
             else:
                 raise TypeError(f"depends_on_columns entry must be a CdsFlowBase subclass or CdsFlowStr, got {item!r}")
 
-        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps, input_type=input_type)
+        source = None
+        if "source" in namespace:
+            source = namespace["source"]
+
+        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps, input_type=input_type, source=source)
 
         for col_name in column_names:
             base_col = next(c for c in flow_columns if c.name == col_name)
