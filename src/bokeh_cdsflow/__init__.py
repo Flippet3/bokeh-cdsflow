@@ -2,100 +2,176 @@ from collections import defaultdict
 from enum import Enum, auto
 import os
 import re
-from typing import Any, ClassVar, Literal, get_args
+from typing import Any, ClassVar, Literal, Sequence, cast
 
 from bokeh.document import Document
 from bokeh.embed import components
 from bokeh.events import DocumentReady
 from bokeh.models import ColumnDataSource, CustomJS
 from bokeh.models.dom import DOMElement
-import pydantic
 
 
 JsType = Literal["number", "string", "boolean", "object", "array", "date", "bigint", "symbol", "function", "undefined", "null", "map", "set"]  # fmt: skip
-_JS_TYPES: frozenset[str] = frozenset(get_args(JsType))
-
-CdsFlowColumnSpec = tuple[str, list[Any]]
-
 
 class InputType(Enum):
     SingleValue = auto()
     Array = auto()
 
+class CdsFlowCol:
+    """
+    Declarative column placeholder used in ``CdsFlowBase`` subclasses.
 
-class CdsFlowColumn(pydantic.BaseModel):
-    name: str
+    It starts out parent-less (declared at class definition time). When a ``CdsFlow`` is
+    constructed, it registers itself as the parent and assigns the final column name.
+    From then on, this object can derive flow-level metadata (like ``input_type``)
+    via ``self.parent``.
+    """
+
+    _parent: "CdsFlowBase | None"
+    _name: str | None
     js_type: JsType
-    initial_value: list = []
+    initial_value: list[Any]
 
-
-class LinkedCdsFlowColumn(pydantic.BaseModel):
-    cds_flow_column: CdsFlowColumn
-    cds_flow_name: str
-    cds_flow_input_type: InputType = InputType.Array
+    def __init__(self, js_type: JsType, initial_value: list[Any], /):
+        self._parent = None
+        self._name = None
+        self.js_type = js_type
+        self.initial_value = initial_value
+    
+    @property
+    def name(self) -> str:
+        if self._name is None:
+            raise ValueError("Tried to access name of Column before adding it to a parent CdsFlow class.")
+        return self._name
+    
+    @property
+    def parent(self) -> "CdsFlowBase":
+        if self._parent is None:
+            raise ValueError("Tried to access parent of Column before adding it to a parent CdsFlow class.")
+        return self._parent
 
     @property
     def js_attr_name(self) -> str:
-        return f"{self.cds_flow_name}_{self.cds_flow_column.name}"
+        if self.parent is None or not self.name:
+            raise ValueError("Unlinked CdsFlowStr has no js_attr_name (missing parent/name).")
+        return f"{self.parent.name}_{self.name}"
 
     @property
     def js_attr_type(self) -> str:
-        if self.cds_flow_input_type == InputType.SingleValue:
-            return self.cds_flow_column.js_type
-        else:
-            return f"{self.cds_flow_column.js_type}[]"
+        if self.parent.input_type == InputType.SingleValue:
+            return self.js_type
+        return f"{self.js_type}[]"
 
     @property
     def js_data_accessor(self) -> str:
-        return f"{self.cds_flow_name}.data.{self.cds_flow_column.name}"
+        if self.parent is None or not self.name:
+            raise ValueError("Unlinked CdsFlowStr has no js_data_accessor (missing parent/name).")
+        return f"{self.parent.name}.data.{self.name}"
 
     @property
     def js_input(self) -> str:
-        if self.cds_flow_input_type == InputType.SingleValue:
+        if self.parent.input_type == InputType.SingleValue:
             return f"{self.js_data_accessor}[0]"
-        else:
-            return f"[... {self.js_data_accessor}]"
+        return f"[... {self.js_data_accessor}]"
 
 
-class CdsFlow:
-    def __init__(
-        self,
-        name: str,
-        columns: list[CdsFlowColumn],
-        depends_on_columns: list[LinkedCdsFlowColumn] | None = None,
-        input_type: InputType = InputType.Array,
-    ):
-        if depends_on_columns is None:
-            depends_on_columns = []
-        self.name = name
-        self.input_type = input_type
-        self._base_columns = columns
-        self.source = ColumnDataSource({column.name: column.initial_value for column in columns})
-        self.depends_on_columns = depends_on_columns
+class CdsFlowBase:
+    """
+    Instance-backed CDS flow row.
+
+    Subclasses declare columns as class attributes using ``CdsFlowCol(...)``.
+    Instances build a concrete ``CdsFlow`` (and therefore ``ColumnDataSource``)
+    so dependencies can be specified per instance.
+    """
+    input_type = InputType.Array
+
+    def __init__(self, key: str | None = None, *, depends: Sequence["CdsFlowBase | CdsFlowCol"] = ()):
+        self.key = key or ""
+        cls = self.__class__
+        self.base_name = re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
+        self.name = self.base_name if not self.key else f"{self.base_name}_{self.key}"
+
+        declared: list[CdsFlowCol] = []
+        # Discover declared columns on every instantiation (including inheritance).
+        # Base class columns appear earlier than subclass columns.
+        for base in reversed(cls.__mro__):
+            if base in (object, CdsFlowBase):
+                continue
+            for col_name, val in base.__dict__.items():
+                if col_name.startswith("_"):
+                    continue
+                if isinstance(val, CdsFlowCol) and val._parent is None:
+                    val._name = col_name
+                    declared.append(val)
+
+        # Create per-instance column objects so `.parent` can differ per instance.
+        cols: list[CdsFlowCol] = []
+        col_map: dict[str, CdsFlowCol] = {}
+        for decl in declared:
+            c = CdsFlowCol(decl.js_type, list(decl.initial_value))
+            c._name = cast(str, decl._name)
+            cols.append(c)
+            col_map[c._name] = c
+        self._cols: dict[str, CdsFlowCol] = col_map
+        self._columns: list[CdsFlowCol] = cols
+
+        linked_deps: list[CdsFlowCol] = []
+        for item in depends:
+            if isinstance(item, CdsFlowBase):
+                linked_deps.extend(item.columns.values())
+            elif isinstance(item, CdsFlowCol):
+                linked_deps.append(item)
+            else:
+                raise TypeError("depends must contain only CdsFlowBase instances or CdsFlowCol instances")
+
+        for col in self._columns:
+            col._parent = self
+        self.source = ColumnDataSource({col.name: col.initial_value for col in self._columns if col.name is not None})
+        self.depends_on_columns = linked_deps
+
+    def __getattribute__(self, name: str) -> Any:
+        # Route column handles to instance-bound objects.
+        if name not in {"_cols", "source"}:
+            cols = object.__getattribute__(self, "_cols") if "_cols" in object.__getattribute__(self, "__dict__") else None
+            if cols is not None and name in cols:
+                return cols[name]
+        return object.__getattribute__(self, name)
 
     @property
-    def columns(self) -> dict[str, LinkedCdsFlowColumn]:
-        if not hasattr(self, "_base_columns"):
+    def columns(self) -> dict[str, CdsFlowCol]:
+        if not hasattr(self, "_columns"):
             return {}
-        return {
-            base_column.name: LinkedCdsFlowColumn(
-                cds_flow_column=base_column,
-                cds_flow_name=self.name,
-                cds_flow_input_type=self.input_type,
-            )
-            for base_column in self._base_columns
-        }
+        return {col.name: col for col in self._columns if col.name is not None}
 
     @property
     def dependencies(self) -> set[str]:
-        return {depends_on_column.cds_flow_name for depends_on_column in self.depends_on_columns}
+        deps: set[str] = set()
+        for col in self.depends_on_columns:
+            deps.add(col.parent.name)
+        return deps
 
     @property
     def callback_name(self) -> str:
-        return f"update_{self.name}"
+        return f"update_{self.callback_group}"
 
     def callback_location(self, file_dir: str) -> str:
-        return os.path.join(file_dir, f"{self.name}.js")
+        return os.path.join(file_dir, f"{self.callback_group}.js")
+
+    @property
+    def callback_group(self) -> str:
+        if not self.key:
+            return self.base_name
+        for col in self.depends_on_columns:
+            if getattr(col.parent, "key", "") != self.key:
+                return self.name
+        return self.base_name
+
+    def canonical_dep_param_name(self, linked_col: CdsFlowCol) -> str:
+        parent = linked_col.parent
+        if self.key and getattr(parent, "key", "") == self.key:
+            parent_base = getattr(parent, "base_name", parent.name)
+            return f"{parent_base}_{linked_col.name}"
+        return linked_col.js_attr_name
 
     def _update_signature(self, file_dir: str) -> None:
         START_MARKER = "// === AUTOGENERATED START ==="
@@ -121,13 +197,18 @@ class CdsFlow:
             start_idx = contents.index(START_MARKER) + len(START_MARKER)
             end_idx = contents.index(END_MARKER)
 
-            jsdoc_lines = [f" * @param {{{col.js_attr_type}}} this_{col.cds_flow_column.name}" for col in self.columns.values()]
-            jsdoc_lines += [f" * @param {{{linked_col.js_attr_type}}} {linked_col.js_attr_name}" for linked_col in self.depends_on_columns]
+            jsdoc_lines = [f" * @param {{{col.js_attr_type}}} this_{col.name}" for col in self.columns.values()]
+            jsdoc_lines += [
+                f" * @param {{{linked_col.js_attr_type}}} {self.canonical_dep_param_name(linked_col)}"
+                for linked_col in self.depends_on_columns
+            ]
 
-            params = [f"this_{col.name}" for col in self._base_columns] + [linked_col.js_attr_name for linked_col in self.depends_on_columns]
+            params = [f"this_{col.name}" for col in self._columns if col.name is not None] + [
+                self.canonical_dep_param_name(linked_col) for linked_col in self.depends_on_columns
+            ]
 
-            if self._base_columns:
-                returns_contents = ", ".join(f"{col.cds_flow_column.name}: {col.js_attr_type}" for col in self.columns.values())
+            if self._columns:
+                returns_contents = ", ".join(f"{col.name}: {col.js_attr_type}" for col in self.columns.values())
                 returns_line = f" * @returns {{{{{returns_contents}}}}}"
             else:
                 returns_line = " * @returns {{}}"
@@ -146,9 +227,31 @@ class CdsFlow:
             f.write(new_contents)
             f.truncate()
 
+    def set_value_str(self, update_dict: dict[CdsFlowCol, str]) -> str:
+        str_update_dict = {key.name: value for (key, value) in update_dict.items()}
+        for key, value in str_update_dict.items():
+            if key not in self.columns:
+                raise KeyError(f"'{key}' is not a valid column name for {self.name}")
+            if not value.startswith("[") and value.endswith("]"):
+                raise ValueError(f"'{key}' has value {value}. It needs to start with '[' and end with ']'.")
+            
+
+        items = []
+        for key, col in self.columns.items():
+            if key in str_update_dict:
+                val = str_update_dict[key]
+            else:
+                val = f"[... {col.js_data_accessor}]"
+            # Value is expected to be a string that will be placed in JS array notation
+            item_str = f"{key}: {val}"
+            items.append(item_str)
+
+        data_str = f"{self.name}.data = {{{', '.join(items)}}};console.log('hi');"
+        return data_str
+
 
 class CdsFlowManager:
-    def __init__(self, cds_flows: list[CdsFlow], js_dir: str, tick_ms: int, engine_setup: str, engine_code: str):
+    def __init__(self, cds_flows: Sequence[CdsFlowBase], js_dir: str, tick_ms: int, engine_setup: str, engine_code: str):
         if not (isinstance(js_dir, str) and os.path.isdir(js_dir)):
             raise ValueError(f"js_dir '{js_dir}' is not a valid directory")
         self.js_dir = js_dir
@@ -222,7 +325,7 @@ class CdsFlowManager:
         for cds_name in graph:
             flow = self.cds_flows[cds_name]
             reflog_checks = [
-                f'refLog["{flow.name}"]["{col.cds_flow_column.name}"] != {flow.name}.data.{col.cds_flow_column.name}' for col in flow.columns.values()
+                f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}' for col in flow.columns.values()
             ]
             update_script += f"""
                 // check if need for update
@@ -235,9 +338,9 @@ class CdsFlowManager:
             if len(flow.dependencies) > 0:
                 args = [col.js_input for col in list(flow.columns.values()) + flow.depends_on_columns]
                 if flow.input_type == InputType.SingleValue:
-                    assignments = [f"'{col.cds_flow_column.name}': [new_data.{col.cds_flow_column.name}]" for col in flow.columns.values()]
+                    assignments = [f"'{col.name}': [new_data.{col.name}]" for col in flow.columns.values()]
                 else:
-                    assignments = [f"'{col.cds_flow_column.name}': new_data.{col.cds_flow_column.name}" for col in flow.columns.values()]
+                    assignments = [f"'{col.name}': new_data.{col.name}" for col in flow.columns.values()]
 
                 update_script += f"""
                     new_data = {flow.callback_name}({", ".join(args)});
@@ -274,154 +377,3 @@ class CdsFlowManager:
             """,
         )
         doc.js_on_event(DocumentReady, c)
-
-
-def _normalize_js_type_string(s: str) -> JsType:
-    if s in _JS_TYPES:
-        return s  # type: ignore[return-value]
-    raise TypeError(f"Column js type must be a JsType string, got {s!r}")
-
-
-def _is_column_spec(val: Any) -> bool:
-    if not isinstance(val, tuple) or len(val) != 2:
-        return False
-    js_t, init = val
-    if not isinstance(js_t, str) or not isinstance(init, list):
-        return False
-    return js_t in _JS_TYPES
-
-
-class CdsFlowStr(str):
-    """Column name as ``str`` for Bokeh, with linkage metadata."""
-
-    linked_column: LinkedCdsFlowColumn
-    extra_info: Any
-
-    def __new__(cls, value: str, linked_column: LinkedCdsFlowColumn, extra_info: Any = None, /, **meta: Any):
-        obj = str.__new__(cls, value)
-        obj.extra_info = extra_info
-        for k, v in meta.items():
-            setattr(obj, k, v)
-        obj.linked_column = linked_column
-        return obj
-
-    @classmethod
-    def spec(cls, js_type: JsType, initial: list[Any]) -> CdsFlowColumnSpec:
-        """Return a column spec tuple; equivalent to ``(js_type, initial)`` with clearer hints."""
-        return (js_type, initial)
-
-
-_CDS_FLOW_RESERVED_NAMES = frozenset(
-    {
-        "input_type",
-        "depends_on_columns",
-        "__cds_name__",
-        "__module__",
-        "__qualname__",
-        "__doc__",
-        "__annotations__",
-        "cds_flow",
-        "source",
-    }
-)
-
-
-class _CdsFlowMeta(type):
-    """Builds a :class:`CdsFlow` from ``(js_type, initial_list)`` column specs and assigns :class:`CdsFlowStr` handles."""
-
-    def __new__(mcs, cls_name: str, bases: tuple[type, ...], namespace: dict[str, Any]) -> type:
-        if cls_name == "CdsFlowBase":
-            return super().__new__(mcs, cls_name, bases, namespace)
-        has_flow_ancestor = CdsFlowBase in bases or any(isinstance(b, type) and issubclass(b, CdsFlowBase) for b in bases)
-        if not has_flow_ancestor:
-            return super().__new__(mcs, cls_name, bases, namespace)
-
-        input_type = namespace.get("input_type", InputType.Array)
-        depends_spec = namespace.get("depends_on_columns", [])
-
-        flow_columns: list[CdsFlowColumn] = []
-        column_names: list[str] = []
-        for col_name, val in list(namespace.items()):
-            if col_name.startswith("_") or col_name in _CDS_FLOW_RESERVED_NAMES:
-                continue
-            if not _is_column_spec(val):
-                continue
-            js_raw, init_val = val
-            js_type = _normalize_js_type_string(js_raw)
-            flow_columns.append(
-                CdsFlowColumn(
-                    name=col_name,
-                    js_type=js_type,
-                    initial_value=init_val,
-                )
-            )
-            column_names.append(col_name)
-
-        if not flow_columns:
-            return super().__new__(mcs, cls_name, bases, namespace)
-
-        cds_name = namespace.get("__cds_name__", re.sub(r"(?<!^)(?=[A-Z])", "_", cls_name).lower())
-        linked_deps: list[LinkedCdsFlowColumn] = []
-        items: tuple[Any, ...] = depends_spec if isinstance(depends_spec, (list, tuple)) else (depends_spec,)
-        for item in items:
-            if isinstance(item, type) and getattr(item, "cds_flow", None) is not None:
-                linked_deps.extend(item.cds_flow.columns.values())
-            elif isinstance(item, CdsFlowStr):
-                linked_deps.append(item.linked_column)
-            else:
-                raise TypeError(f"depends_on_columns entry must be a CdsFlowBase subclass or CdsFlowStr, got {item!r}")
-
-        flow = CdsFlow(cds_name, flow_columns, depends_on_columns=linked_deps, input_type=input_type)
-
-        for col_name in column_names:
-            base_col = next(c for c in flow_columns if c.name == col_name)
-            linked = LinkedCdsFlowColumn(
-                cds_flow_column=base_col,
-                cds_flow_name=cds_name,
-                cds_flow_input_type=input_type,
-            )
-            namespace[col_name] = CdsFlowStr(
-                col_name,
-                linked,
-                extra_info={"js_type": base_col.js_type, "cds_flow_name": cds_name},
-                js_type=base_col.js_type,
-                cds_flow_name=cds_name,
-            )
-
-        namespace["cds_flow"] = flow
-        namespace["source"] = flow.source
-        return super().__new__(mcs, cls_name, bases, namespace)
-
-
-class CdsFlowBase(metaclass=_CdsFlowMeta):
-    """Declarative CDS flow row; not instantiable."""
-
-    source: ClassVar[ColumnDataSource]
-    cds_flow: ClassVar[CdsFlow]
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
-        raise TypeError(f"{cls.__name__} is declarative only and cannot be instantiated.")
-
-    @classmethod
-    def set_value_str(cls, update_dict: dict[str, str]) -> str:
-        for key, value in update_dict.items():
-            key_str = str(key)
-            if key_str not in cls.cds_flow.columns:
-                raise KeyError(f"'{key}' is not a valid column name for {cls.cds_flow}")
-            if not value.startswith("[") and value.endswith("]"):
-                raise ValueError(f"'{key}' has value {value}. It needs to start with '[' and end with ']'.")
-            
-
-        items = []
-        for key, col in cls.cds_flow.columns.items():
-            key_str = str(key)
-            if key_str in update_dict:
-                val = update_dict[key_str]
-            else:
-                val = f"[... {col.js_data_accessor}]"
-            # Value is expected to be a string that will be placed in JS array notation
-            item_str = f"{key_str}: {val}"
-            items.append(item_str)
-
-        data_str = f"{cls.cds_flow.name}.data = {{{', '.join(items)}}}"
-        return data_str
