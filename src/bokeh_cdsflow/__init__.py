@@ -336,9 +336,14 @@ class CdsFlowManager:
         update_script = ""
         for cds_name in graph:
             flow = self.cds_flows[cds_name]
-            reflog_checks = [
-                f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}' for col in flow.columns.values()
-            ]
+            if flow.input_type == InputType.SingleValue:
+                reflog_checks = [
+                    f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}[0]' for col in flow.columns.values()
+                ]
+            else:
+                reflog_checks = [
+                    f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}' for col in flow.columns.values()
+                ]
             update_script += f"""
                 // check if need for update
                 if (!dirty.includes("{flow.name}")) {{
