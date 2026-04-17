@@ -258,7 +258,7 @@ class CdsFlowBase:
             item_str = f"{key}: {val}"
             items.append(item_str)
 
-        data_str = f"{self.name}.data = {{{', '.join(items)}}};console.log('hi');"
+        data_str = f"{self.name}.data = {{{', '.join(items)}}};"
         return data_str
 
 
