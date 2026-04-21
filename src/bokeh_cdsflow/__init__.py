@@ -287,11 +287,11 @@ class CdsFlowManager:
                 if os.path.isfile(file_path):
                     os.remove(file_path)
 
-    def get_components_and_script(self, dom_elements: dict[str, DOMElement] | None = None, document: Document | None = None) -> tuple[str, dict[str, str]]:
+    def get_components_and_script(self, dom_elements: dict[str, DOMElement] | None = None, document: Document | None = None, update_signature: bool = True) -> tuple[str, dict[str, str]]:
         if dom_elements is None:
             dom_elements = {}
         self.doc = document or Document()
-        self._attach_loop(self.doc)
+        self._attach_loop(self.doc, update_signature)
 
         new_dom_elements = dict(dom_elements)
         for value in dom_elements.values():
@@ -305,8 +305,9 @@ class CdsFlowManager:
         script, divs = components(new_dom_elements)
         return script, divs
 
-    def _attach_loop(self, doc: Document) -> None:
-        self.update_signatures()
+    def _attach_loop(self, doc: Document, update_signature: bool) -> None:
+        if update_signature:
+            self.update_signatures()
         callbacks = "\n"
         for flow in self.cds_flows.values():
             if len(flow.dependencies) > 0 or flow.self_depend:
