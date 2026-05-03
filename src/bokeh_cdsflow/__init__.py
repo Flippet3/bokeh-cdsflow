@@ -1,4 +1,5 @@
 from collections import defaultdict
+import copy
 from enum import Enum, auto
 import os
 import re
@@ -16,6 +17,7 @@ JsType = Literal["number", "string", "boolean", "object", "array", "date", "bigi
 class InputType(Enum):
     SingleValue = auto()
     Array = auto()
+    Arrays = auto()
 
 class CdsFlowCol:
     """
@@ -30,9 +32,9 @@ class CdsFlowCol:
     _parent: "CdsFlowBase | None"
     _name: str | None
     js_type: JsType
-    initial_value: list[Any]
+    initial_value: Any
 
-    def __init__(self, js_type: JsType, initial_value: list[Any], /):
+    def __init__(self, js_type: JsType, initial_value: Any, /):
         self._parent = None
         self._name = None
         self.js_type = js_type
@@ -60,19 +62,25 @@ class CdsFlowCol:
     def js_attr_type(self) -> str:
         if self.parent.input_type == InputType.SingleValue:
             return self.js_type
-        return f"{self.js_type}[]"
+        if self.parent.input_type == InputType.Array:
+            return f"{self.js_type}[]"
+        return f"{self.js_type}[][]"
 
     @property
     def js_data_accessor(self) -> str:
         if self.parent is None or not self.name:
             raise ValueError("Unlinked CdsFlowStr has no js_data_accessor (missing parent/name).")
+        if self.parent.input_type == InputType.Arrays:
+            return f"{self.parent.name}.map(src => src.data.{self.name})"
         return f"{self.parent.name}.data.{self.name}"
 
     @property
     def js_input(self) -> str:
         if self.parent.input_type == InputType.SingleValue:
             return f"{self.js_data_accessor}[0]"
-        return f"[... {self.js_data_accessor}]"
+        if self.parent.input_type == InputType.Array:
+            return f"[... {self.js_data_accessor}]"
+        return f"{self.parent.name}.map(src => [...src.data.{self.name}])"
 
 
 class CdsFlowBase:
@@ -91,6 +99,7 @@ class CdsFlowBase:
         *,
         depends: Sequence["CdsFlowBase | CdsFlowCol"] = (),
         source: ColumnDataSource | None = None,
+        sources: list[ColumnDataSource] | None = None,
         self_depend: bool = False,
     ):
         self.key = key or ""
@@ -116,7 +125,7 @@ class CdsFlowBase:
         cols: list[CdsFlowCol] = []
         col_map: dict[str, CdsFlowCol] = {}
         for decl in declared:
-            c = CdsFlowCol(decl.js_type, list(decl.initial_value))
+            c = CdsFlowCol(decl.js_type, copy.deepcopy(decl.initial_value))
             c._name = cast(str, decl._name)
             cols.append(c)
             col_map[c._name] = c
@@ -134,9 +143,36 @@ class CdsFlowBase:
 
         for col in self._columns:
             col._parent = self
-        self.source = source or ColumnDataSource({col.name: col.initial_value for col in self._columns if col.name is not None})
-        # On patching, mark source as dirty.
-        self.source.js_on_change("patching",CustomJS(code=f"cb_obj.data.{self._columns[0].name} = [...cb_obj.data.{self._columns[0].name}];"))
+        if self.input_type == InputType.SingleValue:
+            if sources is not None:
+                raise ValueError("Use 'source' for SingleValue flows, not 'sources'.")
+            self.source = source or ColumnDataSource(
+                {col.name: [col.initial_value] for col in self._columns if col.name is not None}
+            )
+        elif self.input_type == InputType.Array:
+            if sources is not None:
+                raise ValueError("Use 'source' for Array flows, not 'sources'.")
+            self.source = source or ColumnDataSource(
+                {col.name: col.initial_value for col in self._columns if col.name is not None}
+            )
+        elif self.input_type == InputType.Arrays:
+            if source is not None:
+                raise ValueError("Use 'sources' for Arrays flows, not 'source'.")
+            if sources is not None:
+                self.sources = sources
+            else:
+                n = len(self._columns[0].initial_value)
+                self.sources = [
+                    ColumnDataSource(
+                        {col.name: col.initial_value[j] for col in self._columns if col.name is not None}
+                    )
+                    for j in range(n)
+                ]
+
+        patching_cb = CustomJS(code=f"cb_obj.data.{self._columns[0].name} = [...cb_obj.data.{self._columns[0].name}];")
+        srcs_to_patch = self.sources if self.input_type == InputType.Arrays else [self.source]
+        for src in srcs_to_patch:
+            src.js_on_change("patching", patching_cb)
 
         self.depends_on_columns = linked_deps
  
@@ -240,6 +276,8 @@ class CdsFlowBase:
             f.truncate()
 
     def set_value_str(self, update_dict: dict[CdsFlowCol, str]) -> str:
+        if self.input_type == InputType.Arrays:
+            raise NotImplementedError("set_value_str is not implemented for InputType.Arrays")
         str_update_dict = {key.name: value for (key, value) in update_dict.items()}
         for key, value in str_update_dict.items():
             if key not in self.columns:
@@ -297,8 +335,13 @@ class CdsFlowManager:
         for value in dom_elements.values():
             self.doc.add_root(value)
         for i, flow in enumerate(self.cds_flows.values()):
-            new_dom_elements[f"source_{i}"] = flow.source
-            self.doc.add_root(flow.source)
+            if flow.input_type == InputType.Arrays:
+                for j, src in enumerate(flow.sources):
+                    new_dom_elements[f"source_{i}_{j}"] = src
+                    self.doc.add_root(src)
+            else:
+                new_dom_elements[f"source_{i}"] = flow.source
+                self.doc.add_root(flow.source)
 
         assert set(new_dom_elements.values()) == set(self.doc.roots)
 
@@ -341,9 +384,13 @@ class CdsFlowManager:
                 reflog_checks = [
                     f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}[0]' for col in flow.columns.values()
                 ]
-            else:
+            elif flow.input_type == InputType.Array:
                 reflog_checks = [
                     f'refLog["{flow.name}"]["{col.name}"] != {flow.name}.data.{col.name}' for col in flow.columns.values()
+                ]
+            else:  # Arrays
+                reflog_checks = [
+                    f'{flow.name}.some((src, i) => (refLog["{flow.name}"]["{col.name}"] || [])[i] != src.data.{col.name})' for col in flow.columns.values()
                 ]
             update_script += f"""
                 // check if need for update
@@ -357,14 +404,25 @@ class CdsFlowManager:
                 args = [col.js_input for col in list(flow.columns.values()) + flow.depends_on_columns]
                 if flow.input_type == InputType.SingleValue:
                     assignments = [f"'{col.name}': [new_data.{col.name}]" for col in flow.columns.values()]
-                else:
-                    assignments = [f"'{col.name}': new_data.{col.name}" for col in flow.columns.values()]
-
-                update_script += f"""
+                    update_script += f"""
                     new_data = {flow.callback_name}({", ".join(args)});
                     {flow.name}.data = {{
                         {", ".join(assignments)}
                     }};"""
+                elif flow.input_type == InputType.Array:
+                    assignments = [f"'{col.name}': new_data.{col.name}" for col in flow.columns.values()]
+                    update_script += f"""
+                    new_data = {flow.callback_name}({", ".join(args)});
+                    {flow.name}.data = {{
+                        {", ".join(assignments)}
+                    }};"""
+                else:  # Arrays
+                    col_names = list(flow.columns.keys())
+                    update_script += f"""
+                    new_data = {flow.callback_name}({", ".join(args)});
+                    {flow.name}.forEach((src, i) => {{
+                        src.data = {{{", ".join(f"'{c}': new_data.{c}[i]" for c in col_names)}}};
+                    }});"""
             if len(dirty_requests[flow.name]) > 0:
                 update_script += f"""
                     ["{'","'.join(dirty_requests[flow.name])}"].forEach((dep) => {{if (!dirty.includes(dep) && dep !== "") {{dirty.push(dep)}}}});"""
@@ -372,13 +430,16 @@ class CdsFlowManager:
                     dirty.splice(dirty.indexOf('{flow.name}'), 1);"""
 
             update_script += f"""
-                    {"; ".join(it.replace("!=", "=") for it in reflog_checks)};
+                    {"; ".join(
+                        f'refLog["{flow.name}"]["{col.name}"] = {flow.name}.map(src => src.data.{col.name})'
+                        for col in flow.columns.values()
+                    ) if flow.input_type == InputType.Arrays else "; ".join(it.replace("!=", "=") for it in reflog_checks)};
 
                 }}
             """
 
         c = CustomJS(
-            args={flow.name: flow.source for flow in self.cds_flows.values()},
+            args={flow.name: (flow.sources if flow.input_type == InputType.Arrays else flow.source) for flow in self.cds_flows.values()},
             code=f"""
                 {callbacks}
 
